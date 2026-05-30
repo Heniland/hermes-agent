@@ -427,3 +427,100 @@ class TestBugReproductionAnchor:
         # main provider in #24015.
         assert "data:image" not in resp
         assert "image_url" not in resp
+
+
+# ---------------------------------------------------------------------------
+# Regression: cache directory must be created if it does not exist (#34000)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_cache_dir_no_precreate(tmp_path):
+    """Patch get_hermes_dir to return a path that DOES NOT exist yet.
+
+    The fix for #34000 adds ``cache_dir.mkdir(parents=True, exist_ok=True)``
+    so _route_capture_through_aux_vision does NOT raise FileNotFoundError
+    when the aux-vision cache directory has never been created.
+    """
+    non_existing = tmp_path / "cache_vision"  # NOT created
+
+    def _fake_get(*_args, **_kw):
+        return non_existing
+
+    with patch("hermes_constants.get_hermes_dir", _fake_get):
+        yield non_existing
+
+
+class TestCacheDirCreatedWhenMissing:
+    """Verify the aux-vision cache directory is created automatically.
+
+    Regression test for the bug where ``computer_use(action='capture')``
+    raised ``FileNotFoundError`` when the ``temp_vision_images`` directory
+    didn't exist — a common first-run scenario on fresh installs.
+    """
+
+    def test_capture_creates_cache_dir_when_missing(
+        self, tmp_cache_dir_no_precreate,
+    ):
+        from tools.computer_use import tool as cu_tool
+
+        cache_path = tmp_cache_dir_no_precreate
+
+        # Directory must NOT exist before the call — this is the bug scenario.
+        assert not cache_path.exists()
+
+        cap = _make_capture(mode="som")
+
+        def _fake_run_async(coro):
+            return _stub_aux_analysis(
+                "A terminal window showing a shell prompt."
+            )
+
+        fake_vat = MagicMock(return_value="<coro>")
+
+        with patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=True), \
+             patch("model_tools._run_async", side_effect=_fake_run_async), \
+             patch("tools.vision_tools.vision_analyze_tool",
+                   new_callable=lambda: fake_vat):
+            resp = cu_tool._capture_response(cap)
+
+        # The directory must now exist — the mkdir call worked.
+        assert cache_path.exists()
+        assert cache_path.is_dir()
+
+        # Response must be text-only (no image_url).
+        assert isinstance(resp, str)
+        body = json.loads(resp)
+        assert body["vision_analysis_routed_via"] == "auxiliary.vision"
+        assert "data:image" not in resp
+
+    def test_capture_creates_nested_cache_dirs_when_missing(
+        self, tmp_path,
+    ):
+        """Verify mkdir(parents=True) creates intermediate directories."""
+        from tools.computer_use import tool as cu_tool
+
+        deep_path = tmp_path / "a" / "b" / "c" / "cache_vision"
+
+        def _fake_get(*_args, **_kw):
+            return deep_path
+
+        with patch("hermes_constants.get_hermes_dir", _fake_get):
+            cap = _make_capture(mode="som")
+
+            def _fake_run_async(_coro):
+                return _stub_aux_analysis("description")
+
+            fake_vat = MagicMock(return_value="<coro>")
+
+            with patch.object(cu_tool, "_should_route_through_aux_vision",
+                              return_value=True), \
+                 patch("model_tools._run_async", side_effect=_fake_run_async), \
+                 patch("tools.vision_tools.vision_analyze_tool",
+                       new_callable=lambda: fake_vat):
+                resp = cu_tool._capture_response(cap)
+
+        # mkdir(parents=True) created the full nested path.
+        assert deep_path.exists()
+        assert deep_path.is_dir()
+        assert isinstance(resp, str)
